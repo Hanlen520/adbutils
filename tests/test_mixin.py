@@ -62,3 +62,15 @@ def test_current_app(device: AdbDevice):
     info = device.current_app()
     assert 'package' in info
     assert 'activity' in info
+
+def test_app_start_stop(device: AdbDevice):
+    d = device
+    package_name = "io.appium.android.apis"
+    if package_name not in d.list_packages():
+        pytest.skip(package_name + " should be installed, to start test")
+    d.app_start(package_name)
+    time.sleep(1)
+    assert device.current_app()['package'] == package_name
+    d.app_stop(package_name)
+    time.sleep(.5)
+    assert device.current_app()['package'] != package_name

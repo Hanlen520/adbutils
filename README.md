@@ -62,6 +62,18 @@ for item in adb.forward_list("8d1f93be"):
     print(item.serial, item.local, item.remote)
     # 8d1f93be tcp:10603 tcp:7912
     # 12345678 tcp:10664 tcp:7912
+
+
+# 监控设备连接 track-devices
+for event in adb.track_devices():
+    print(event.present, event.serial, event.status)
+
+## When plugin two device, output
+# True WWUDU16C22003963 device
+# True bf755cab device
+# False bf755cab device
+
+# When adb-server killed, AdbError will be raised
 ```
 
 ## Run shell command and transfer files
@@ -75,6 +87,15 @@ d = adb.device()
 
 print(d.serial) # 获取序列号
 print(d.shell(["getprop", "ro.serial"])) # 获取Prop信息
+
+# show property
+print(d.prop.name) # output example: surabaya
+d.prop.model
+d.prop.device
+d.prop.get("ro.product.model")
+d.prop.get("ro.product.model", cache=True) # a little faster, use cache data first
+
+
 d.sync.push(io.BytesIO(b"Hello Android"), "/data/local/tmp/hi.txt") # 推送文件
 
 # 读取文件
@@ -87,7 +108,12 @@ d.sync.pull("/data/local/tmp/hi.txt", "hi.txt")
 # 获取包的信息
 info = d.package_info("com.example.demo")
 if info:
-    print(info) # expect {"version_name": "1.2.3", "version_code": "12", "signature": "0xff132"}
+    print(info) 
+	# output example:
+    # {
+	# "version_name": "1.2.3", "version_code": "12", "signature": "0xff132", 
+    # "first_install_time": datetime-object, "last_update_time": datetime-object,
+    # }
 ```
 
 ## Extended Functions
@@ -122,6 +148,23 @@ d.send_keys("hello world$%^&*") # simulate: adb shell input text "hello%sworld\%
 
 d.open_browser("https://www.baidu.com") # 打开百度
 # There still too many functions, please see source codes
+
+d.is_screen_on() # 返回屏幕是否亮屏 True or False
+```
+
+Screenrecord
+
+```
+# run screenrecord to record screen
+r = d.screenrecord()
+# sleep for a while, can not large then 3 minutes
+r.stop() # stop recording
+r.stop_and_pull("video.mp4") # stop recording and pull video to local, then remove video from device
+
+# control start time manually
+r = d.screenrecord(no_autostart=True)
+r.start() # start record
+r.stop_and_pull("video.mp4") # stop recording and pull video to local, then remove video from device
 ```
 
 For further usage, please read [mixin.py](adbutils/mixin.py) for details.
@@ -180,12 +223,17 @@ $ python -m adbutils -V
 $ python -m adbutils -i some.apk
 # Install apk from URL 通过URL安装apk(带有进度)
 $ python -m adbutils -i http://example.com/some.apk
+# Install and launch (-L or --launch)
+$ python -m adbutils -i http://example.com/some.apk -L
 
 # Uninstall 卸载应用
 $ python -m adbutils -u com.github.example
 
 # Push
 $ python -m adbutils --push local.txt:/sdcard/remote.txt
+
+# Pull
+$ python -m adbutils --pull /sdcard/remote.txt # save to ./remote.txt
 
 # List installed packages 列出所有应用
 $ python -m adbutils --list-packages

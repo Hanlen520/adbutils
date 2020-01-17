@@ -3,9 +3,13 @@ import json
 import re
 import time
 import typing
+import warnings
+from datetime import datetime
 from collections import namedtuple
 
+import apkutils2
 from retry import retry
+
 from adbutils.errors import AdbError, AdbInstallError
 
 _DISPLAY_RE = re.compile(
@@ -17,6 +21,7 @@ WindowSize = namedtuple("WindowSize", ['width', 'height'])
 
 class ShellMixin(object):
     """ provide custom functions for some complex operations """
+
     def _run(self, cmd) -> str:
         return self.shell(cmd)
 
@@ -100,7 +105,7 @@ class ShellMixin(object):
         return self._run(
             ['input', 'swipe', x1, y1, x2, y2,
              str(int(duration * 1000))])
-    
+
     def send_keys(self, text: str):
         """ 
         Type a given text 
@@ -110,12 +115,12 @@ class ShellMixin(object):
         """
         escaped_text = self._escape_special_characters(text)
         return self._run(['input', 'text', escaped_text])
-    
+
     @staticmethod
     def _escape_special_characters(text):
         """
         A helper that escape special characters
-        
+
         Args:
             text: str
         """
@@ -150,7 +155,7 @@ class ShellMixin(object):
                                                 "@":  r"\@",
                                                 "/":  r"\/",
                                                 "_":  r"\_",
-                                                " ":  r"%s", # special
+                                                " ":  r"%s",  # special
                                                 "&":  r"\&"}))
         return escaped
 
@@ -165,16 +170,24 @@ class ShellMixin(object):
         result = self._run(['ifconfig', 'wlan0'])
         return re.findall(r'inet\s*addr:(.*?)\s', result, re.DOTALL)[0]
 
-    def install(self, apk_path: str):
+    def install(self, apk_path: str, force: bool = False):
         """
         sdk = self.getprop('ro.build.version.sdk')
         sdk > 23 support -g
+
+        Args:
+            force (bool): uninstall package before install
 
         Raises:
             AdbInstallError
         """
         dst = "/data/local/tmp/tmp-{}.apk".format(int(time.time() * 1000))
+
         self.sync.push(apk_path, dst)
+        if force:
+            apk = apkutils2.APK(apk_path)
+            package_name = apk.manifest.package_name
+            self.uninstall(package_name)
         self.install_remote(dst, clean=True)
 
     def install_remote(self,
@@ -215,31 +228,45 @@ class ShellMixin(object):
             list of package names
         """
         result = []
-        output = self._run(["pm", "list", "packages", "-3"])
-        for m in re.finditer(r'^package:([^\s]+)$', output, re.M):
+        output = self._run(["pm", "list", "packages"])
+        for m in re.finditer(r'^package:([^\s]+)\r?$', output, re.M):
             result.append(m.group(1))
         return list(sorted(result))
 
-    def package_info(self, pkg_name: str) -> typing.Union[dict, None]:
+    def package_info(self, package_name: str) -> typing.Union[dict, None]:
         """
         version_code might be empty
 
         Returns:
             None or dict(version_name, version_code, signature)
         """
-        output = self._run(['dumpsys', 'package', pkg_name])
+        output = self._run(['dumpsys', 'package', package_name])
         m = re.compile(r'versionName=(?P<name>[\d.]+)').search(output)
         version_name = m.group('name') if m else ""
         m = re.compile(r'versionCode=(?P<code>\d+)').search(output)
         version_code = m.group('code') if m else ""
         if version_code == "0":
             version_code = ""
-        m = re.search(r'PackageSignatures\{(.*?)\}', output)
+        m = re.search(r'PackageSignatures\{.*?\[(.*)\]\}', output)
         signature = m.group(1) if m else None
         if not version_name and signature is None:
             return None
+        m = re.compile(r"pkgFlags=\[\s*(.*)\s*\]").search(output)
+        pkgflags = m.group(1) if m else ""
+        pkgflags = pkgflags.split()
+
+        time_regex = r"[-\d]+\s+[:\d]+"
+        m = re.compile(f"firstInstallTime=({time_regex})").search(output)
+        first_install_time = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") if m else None
+
+        m = re.compile(f"lastUpdateTime=({time_regex})").search(output)
+        last_update_time= datetime.strptime(m.group(1).strip(), "%Y-%m-%d %H:%M:%S") if m else None
+
         return dict(version_name=version_name,
                     version_code=version_code,
+                    flags=pkgflags,
+                    first_install_time=first_install_time,
+                    last_update_time=last_update_time,
                     signature=signature)
 
     def rotation(self) -> int:
@@ -306,8 +333,17 @@ class ShellMixin(object):
                 "android.intent.category.LAUNCHER", "1"
             ])
 
+    def app_stop(self, package_name: str):
+        """ stop app with "am force-stop"
+        """
+        self._run(['am', 'force-stop', package_name])
+
     def app_clear(self, package_name: str):
         self._run(["pm", "clear", package_name])
+
+    def is_screen_on(self):
+        output = self._run(["dumpsys", "power"])
+        return 'mHoldingDisplaySuspendBlocker=true' in output
 
     def open_browser(self, url: str):
         if not re.match("^https?://", url):
@@ -318,7 +354,7 @@ class ShellMixin(object):
     def dump_hierarchy(self):
         """
         uiautomator dump
-        
+
         Returns:
             content of xml
         """
@@ -371,3 +407,63 @@ class ShellMixin(object):
         if ret:  # get last result
             return ret
         raise AdbError("Couldn't get focused app")
+
+    def remove(self, path: str):
+        """ rm device file """
+        self.shell(["rm", path])
+
+    def screenrecord(self, remote_path=None, no_autostart=False):
+        """
+        Args:
+            remote_path: device video path
+            no_autostart: do not start screenrecord, when call this method
+        """
+        return _ScreenRecord(self, remote_path, autostart=not no_autostart)
+
+
+class _ScreenRecord():
+    def __init__(self, d, remote_path=None, autostart=False):
+        """ The maxium record time is 3 minutes """
+        self._d = d
+        if not remote_path:
+            remote_path = "/sdcard/video-%d.mp4" % int(time.time() * 1000)
+        self._remote_path = remote_path
+        self._stream = None
+        self._stopped = False
+        self._started = False
+
+        if autostart:
+            self.start()
+
+    def start(self):
+        """ start recording """
+        if self._started:
+            warnings.warn("screenrecord already started", UserWarning)
+            return
+        self._stream = self._d.shell(
+            ["screenrecord", self._remote_path], stream=True)
+        self._started = True
+
+    def stop(self):
+        """ stop recording """
+        if not self._started:
+            raise RuntimeError("screenrecord is not started")
+
+        if self._stopped:
+            return
+        self._stream.send("\003")
+        self._stream.read_until_close()
+        self._stream.close()
+        self._stopped = True
+
+    def stop_and_pull(self, path: str):
+        """ pull remote to local and remove remote file """
+        self.stop()
+        self._d.sync.pull(self._remote_path, path)
+        self._d.remove(self._remote_path)
+
+    def close(self):  # alias of stop
+        return self.stop()
+
+    def close_and_pull(self, path: str):  # alias of stop_and_pull
+        return self.stop_and_pull(path=path)

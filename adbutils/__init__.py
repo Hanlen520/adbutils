@@ -27,12 +27,13 @@ _OKAY = "OKAY"
 _FAIL = "FAIL"
 _DENT = "DENT"  # Directory Entity
 _DONE = "DONE"
+_DATA = "DATA"
 
 _DISPLAY_RE = re.compile(
     r'.*DisplayViewport{valid=true, .*orientation=(?P<orientation>\d+), .*deviceWidth=(?P<width>\d+), deviceHeight=(?P<height>\d+).*'
 )
 
-DeviceItem = namedtuple("Device", ["serial", "status"])
+DeviceEvent = namedtuple('DeviceEvent', ['present', 'serial', 'status'])
 ForwardItem = namedtuple("ForwardItem", ["serial", "local", "remote"])
 FileInfo = namedtuple("FileInfo", ['mode', 'size', 'mtime', 'name'])
 WindowSize = namedtuple("WindowSize", ['width', 'height'])
@@ -102,10 +103,9 @@ class _AdbStreamConnection(object):
     def send(self, cmd: str):
         self.conn.send("{:04x}{}".format(len(cmd), cmd).encode("utf-8"))
 
-    def read(self, n: int) -> str:
-        return self.conn.recv(n).decode()
-
     def read_raw(self, n: int) -> bytes:
+        """ read fully 
+        """
         t = n
         buffer = b''
         while t > 0:
@@ -116,18 +116,29 @@ class _AdbStreamConnection(object):
             t = n - len(buffer)
         return buffer
 
+    def read(self, n: int) -> str:
+        data = self.read_raw(n).decode()
+        return data
+
     def read_string(self) -> str:
-        size = int(self.read(4), 16)
+        """
+        Raises:
+            AdbError
+        """
+        length = self.read(4)
+        if not length:
+            raise AdbError("connection closed")
+        size = int(length, 16)
         return self.read(size)
 
     def read_until_close(self) -> str:
-        content = ""
+        content = b""
         while True:
-            chunk = self.read(4096)
+            chunk = self.read_raw(4096)
             if not chunk:
                 break
             content += chunk
-        return content
+        return content.decode('utf-8', errors='ignore')
 
     def check_okay(self):
         data = self.read(4)
@@ -169,7 +180,7 @@ class AdbClient(object):
         """ adb connect $addr
         Returns:
             content adb server returns
-        
+
         Example returns:
             - "already connected to 192.168.190.101:5555"
             - "unable to connect to 192.168.190.101:5551"
@@ -212,6 +223,49 @@ class AdbClient(object):
         finally:
             if not stream:
                 c.close()
+    
+    def track_devices(self, limit_status=['device']):
+        """
+        track-devices
+
+        Args:
+            limit_status: eg, ['device', 'offline'], empty means all status
+
+        Returns:
+            iter of DeviceEvent 
+        
+        Raises:
+            AdbError when adb-server was killed
+        """
+        orig_devices = []
+
+        with self._connect() as c:
+            c.send("host:track-devices")
+            c.check_okay()
+            while True:
+                output = c.read_string()
+                curr_devices = self._output2devices(output, limit_status)
+                for event in self._diff_devices(orig_devices, curr_devices):
+                    yield event
+                orig_devices = curr_devices
+
+    def _output2devices(self, output: str, limit_status=[]):
+        devices = []
+        for line in output.splitlines():
+            fields = line.strip().split("\t", maxsplit=1)
+            if len(fields) != 2:
+                continue
+            serial, status = fields
+            if limit_status and status not in limit_status:
+                continue
+            devices.append(DeviceEvent(None, serial, status))
+        return devices
+
+    def _diff_devices(self, orig: list, curr: list):
+        for d in set(orig).difference(curr):
+            yield DeviceEvent(False, d.serial, d.status)
+        for d in set(curr).difference(orig):
+            yield DeviceEvent(True, d.serial, d.status)
 
     def forward_list(self, serial: Union[None, str] = None):
         with self._connect() as c:
@@ -250,7 +304,7 @@ class AdbClient(object):
     def iter_device(self):
         """
         Returns:
-            list of DeviceItem
+            iter of AdbDevice
         """
         with self._connect() as c:
             c.send("host:devices")
@@ -303,6 +357,7 @@ class AdbDevice(ShellMixin):
     def __init__(self, client: AdbClient, serial: str):
         self._client = client
         self._serial = serial
+        self._properties = {} # store properties data
 
     @property
     def serial(self):
@@ -315,8 +370,12 @@ class AdbDevice(ShellMixin):
     def sync(self) -> 'Sync':
         return Sync(self._client, self.serial)
 
+    @property
+    def prop(self) -> "Property":
+        return Property(self)
+
     def adb_output(self, *args, **kwargs):
-        """Run adb command and get its content
+        """Run adb command use subprocess and get its content
 
         Returns:
             string of output
@@ -351,7 +410,7 @@ class AdbDevice(ShellMixin):
 
         Returns:
             string of output
-        
+
         Examples:
             shell("ls -l")
             shell(["ls", "-l"])
@@ -430,8 +489,11 @@ class Sync():
                 mode, size, mtime, namelen = struct.unpack(
                     "<IIII", c.conn.recv(16))
                 name = c.read(namelen)
-                yield FileInfo(mode, size,
-                               datetime.datetime.fromtimestamp(mtime), name)
+                try:
+                    mtime = datetime.datetime.fromtimestamp(mtime)
+                except OSError:  # bug in Python 3.6
+                    mtime = datetime.datetime.now()
+                yield FileInfo(mode, size, mtime, name)
 
     def list(self, path: str):
         return list(self.iter_directory(path))
@@ -465,14 +527,20 @@ class Sync():
         with self._prepare_sync(path, "RECV") as c:
             while True:
                 cmd = c.read(4)
-                if cmd == "DONE":
+                if cmd == _FAIL:
+                    str_size = struct.unpack("<I", c.read_raw(4))[0]
+                    error_message = c.read(str_size)
+                    raise AdbError(error_message)
+                elif cmd == _DONE:
                     break
-                assert cmd == "DATA"
-                chunk_size = struct.unpack("<I", c.read_raw(4))[0]
-                chunk = c.read_raw(chunk_size)
-                if len(chunk) != chunk_size:
-                    raise RuntimeError("read chunk missing")
-                yield chunk
+                elif cmd == _DATA:
+                    chunk_size = struct.unpack("<I", c.read_raw(4))[0]
+                    chunk = c.read_raw(chunk_size)
+                    if len(chunk) != chunk_size:
+                        raise RuntimeError("read chunk missing")
+                    yield chunk
+                else:
+                    raise AdbError("Invalid sync cmd", cmd)
 
     def pull(self, src: str, dst: str) -> int:
         """
@@ -489,7 +557,34 @@ class Sync():
             return size
 
 
+class Property():
+    def __init__(self, d: AdbDevice):
+        self._d = d
+
+    def __str__(self):
+        return f"product:{self.name} model:{self.model} device:{self.device}"
+
+    def get(self, name: str, cache=True) -> str:
+        if cache and name in self._d._properties:
+            return self._d._properties[name]
+        value = self._d._properties[name] = self._d.shell(['getprop', name]).strip()
+        return value
+
+    @property
+    def name(self):
+        return self.get("ro.product.name", cache=True)
+
+    @property
+    def model(self):
+        return self.get("ro.product.model", cache=True)
+
+    @property
+    def device(self):
+        return self.get("ro.product.device", cache=True)
+
+
 adb = AdbClient()
+
 # device = adb.device
 # devices = adb.devices
 
